@@ -1,0 +1,17 @@
+[package]
+name = "webp-anim"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Sequential, bounded-memory animated WebP processing for Rust"
+license = "MIT"
+repository = "https://github.com/cbz-tools/webp-anim"
+homepage = "https://github.com/cbz-tools/webp-anim"
+documentation = "https://docs.rs/webp-anim"
+readme = "README.md"
+keywords = ["webp", "animation", "image-processing", "image-codec"]
+categories = ["multimedia::images", "multimedia::encoding"]
+
+[dependencies]
+fast_image_resize = "=5.0.0"
+libwebp-sys = "0.9.6"
