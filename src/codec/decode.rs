@@ -1,10 +1,11 @@
 use std::{error::Error, fmt, time::Duration};
 
 use libwebp_sys::{
-    WEBP_CSP_MODE, WebPAnimDecoder, WebPAnimDecoderDelete, WebPAnimDecoderGetInfo,
-    WebPAnimDecoderGetNext, WebPAnimDecoderHasMoreFrames, WebPAnimDecoderNewInternal,
-    WebPAnimDecoderOptions, WebPAnimDecoderOptionsInitInternal, WebPAnimInfo, WebPData,
-    WebPGetDemuxABIVersion,
+    WEBP_CSP_MODE, WebPAnimDecoder, WebPAnimDecoderDelete, WebPAnimDecoderGetDemuxer,
+    WebPAnimDecoderGetInfo, WebPAnimDecoderGetNext, WebPAnimDecoderHasMoreFrames,
+    WebPAnimDecoderNewInternal, WebPAnimDecoderOptions, WebPAnimDecoderOptionsInitInternal,
+    WebPAnimDecoderReset, WebPAnimInfo, WebPData, WebPDemuxGetFrame, WebPDemuxNextFrame,
+    WebPDemuxReleaseIterator, WebPGetDemuxABIVersion, WebPIterator,
 };
 
 use crate::{
@@ -152,6 +153,60 @@ impl Drop for AnimationDecoder {
     }
 }
 
+struct RawDecoderGuard(*mut WebPAnimDecoder);
+
+impl RawDecoderGuard {
+    fn into_raw(mut self) -> *mut WebPAnimDecoder {
+        let decoder = self.0;
+        self.0 = std::ptr::null_mut();
+        decoder
+    }
+}
+
+impl Drop for RawDecoderGuard {
+    fn drop(&mut self) {
+        // SAFETY: the pointer is returned by libwebp and is released at most once;
+        // `into_raw` nulls it before ownership is transferred to `AnimationDecoder`.
+        unsafe {
+            if !self.0.is_null() {
+                WebPAnimDecoderDelete(self.0);
+            }
+        }
+    }
+}
+
+struct DemuxIteratorGuard {
+    iterator: WebPIterator,
+    initialized: bool,
+}
+
+impl DemuxIteratorGuard {
+    fn new() -> Self {
+        // SAFETY: `WebPIterator` is a C struct whose fields are initialized by
+        // `WebPDemuxGetFrame`; zeroed storage is valid for that writable input.
+        Self {
+            iterator: unsafe { std::mem::zeroed() },
+            initialized: false,
+        }
+    }
+
+    fn mark_initialized(&mut self) {
+        self.initialized = true;
+    }
+}
+
+impl Drop for DemuxIteratorGuard {
+    fn drop(&mut self) {
+        // SAFETY: the iterator storage remains valid for the guard lifetime;
+        // libwebp requires releasing the iterator after the demux attempt and
+        // before the borrowed demuxer can be used or destroyed.
+        if self.initialized {
+            // SAFETY: `initialized` is set only after WebPDemuxGetFrame succeeds.
+            unsafe { WebPDemuxReleaseIterator(&mut self.iterator) };
+        }
+    }
+}
+
 impl AnimationDecoder {
     /// Creates a decoder for one stored animated WebP sequence.
     ///
@@ -185,17 +240,16 @@ impl AnimationDecoder {
             size: input.len(),
         };
         // SAFETY: `input` is moved into `Self`, keeping `data.bytes` valid until the decoder drops.
-        let decoder = unsafe { WebPAnimDecoderNewInternal(&data, &options, demux_abi) };
-        if decoder.is_null() {
+        let raw_decoder = unsafe { WebPAnimDecoderNewInternal(&data, &options, demux_abi) };
+        if raw_decoder.is_null() {
             return Err(DecodeError::DecoderCreation);
         }
+        let decoder_guard = RawDecoderGuard(raw_decoder);
 
         // SAFETY: libwebp writes `raw_info` when given a valid decoder.
         let mut raw_info: WebPAnimInfo = unsafe { std::mem::zeroed() };
-        // SAFETY: `decoder` is non-null and `raw_info` is valid writable storage.
-        if unsafe { WebPAnimDecoderGetInfo(decoder, &mut raw_info) } == 0 {
-            // SAFETY: creation succeeded, so the decoder must be released on this early return.
-            unsafe { WebPAnimDecoderDelete(decoder) };
+        // SAFETY: `decoder_guard.0` is non-null and `raw_info` is valid writable storage.
+        if unsafe { WebPAnimDecoderGetInfo(decoder_guard.0, &mut raw_info) } == 0 {
             return Err(DecodeError::DecoderInfo);
         }
 
@@ -228,7 +282,7 @@ impl AnimationDecoder {
         };
         Ok(Self {
             _input: input,
-            decoder,
+            decoder: decoder_guard.into_raw(),
             info: AnimationInfo {
                 canvas,
                 frame_count: raw_info.frame_count,
@@ -247,6 +301,97 @@ impl AnimationDecoder {
     /// Returns metadata for the stored animation sequence.
     pub fn info(&self) -> &AnimationInfo {
         &self.info
+    }
+
+    /// Returns one source display duration per stored frame, in frame order.
+    ///
+    /// This reads animation-container metadata only: it does not decode RGBA
+    /// pixels or advance the sequential decoder. The configured total-duration
+    /// limit is applied and may cause this method to return an error.
+    pub fn frame_durations(&self) -> Result<Vec<Duration>, DecodeError> {
+        // SAFETY: `decoder` is non-null and remains valid for this value's lifetime;
+        // libwebp returns a borrowed demuxer owned by that decoder.
+        let demuxer = unsafe { WebPAnimDecoderGetDemuxer(self.decoder) };
+        if demuxer.is_null() {
+            return Err(DecodeError::DecoderInfo);
+        }
+
+        let mut iterator = DemuxIteratorGuard::new();
+        // SAFETY: `demuxer` is non-null and borrowed for the guard lifetime;
+        // `iterator` is valid writable storage for libwebp to initialize.
+        if unsafe { WebPDemuxGetFrame(demuxer, 1, &mut iterator.iterator) } == 0 {
+            return Err(DecodeError::DecoderInfo);
+        }
+        iterator.mark_initialized();
+
+        let frame_count = usize::try_from(self.info.frame_count)
+            .map_err(|_| DecodeError::InvalidAnimationInfo)?;
+        if u32::try_from(iterator.iterator.num_frames).ok() != Some(self.info.frame_count)
+            || iterator.iterator.frame_num != 1
+        {
+            return Err(DecodeError::InvalidAnimationInfo);
+        }
+
+        let mut durations = Vec::with_capacity(frame_count);
+        let mut total_duration = Duration::ZERO;
+        loop {
+            let actual_count = durations.len().saturating_add(1);
+            if actual_count > frame_count {
+                return Err(DecodeError::InvalidAnimationInfo);
+            }
+            if i32::try_from(actual_count).ok() != Some(iterator.iterator.frame_num) {
+                return Err(DecodeError::InvalidAnimationInfo);
+            }
+
+            let duration_ms = iterator.iterator.duration;
+            if duration_ms < 0 {
+                return Err(DecodeError::InvalidTimestamp);
+            }
+            let duration = Duration::from_millis(
+                u64::try_from(duration_ms).map_err(|_| DecodeError::InvalidTimestamp)?,
+            );
+            total_duration = total_duration
+                .checked_add(duration)
+                .ok_or(DecodeError::InvalidTimestamp)?;
+            let total_duration_ms = u64::try_from(total_duration.as_millis())
+                .map_err(|_| DecodeError::InvalidTimestamp)?;
+            enforce_limit(
+                "total duration in milliseconds",
+                total_duration_ms,
+                self.max_total_duration
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            )?;
+            durations.push(duration);
+
+            // SAFETY: the iterator was initialized successfully and its
+            // borrowed demuxer remains alive; libwebp advances only its
+            // iterator state and reports the end through the return value.
+            if unsafe { WebPDemuxNextFrame(&mut iterator.iterator) } == 0 {
+                break;
+            }
+        }
+
+        if durations.len() != frame_count {
+            return Err(DecodeError::InvalidAnimationInfo);
+        }
+        Ok(durations)
+    }
+
+    /// Resets this decoder to the first frame of its stored animation sequence.
+    ///
+    /// The decoder, input allocation, immutable metadata, and configured limits
+    /// are preserved; only libwebp's sequence state and this wrapper's timing
+    /// accumulator are reset.
+    /// This is a sequence reset, not a random-seek operation; the next
+    /// [`Self::next_frame`] call starts at the first stored frame.
+    pub fn reset(&mut self) {
+        // SAFETY: `decoder` is non-null and remains valid for this value's lifetime;
+        // libwebp resets only the native decoder sequence state.
+        unsafe { WebPAnimDecoderReset(self.decoder) };
+        self.previous_timestamp_ms = 0;
+        self.total_duration = Duration::ZERO;
     }
 
     /// Returns whether unread frames remain in the stored sequence.

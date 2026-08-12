@@ -2,8 +2,11 @@
 
 //! Inspect, decode, resize, and encode animated WebP images.
 //!
-//! The crate exposes container inspection, sequential full-canvas RGBA decoding,
-//! reusable animation-frame resizing, and sequential animated-WebP encoding.
+//! The crate exposes lightweight frame-duration metadata inspection, sequential
+//! full-canvas RGBA decoding, reusable animation-frame resizing, and sequential
+//! animated-WebP encoding. [`AnimationDecoder::frame_durations`] reads stored
+//! durations without decoding pixels or advancing the decoder, while
+//! [`AnimationDecoder::reset`] reuses a decoder from the start of its sequence.
 //! Frame durations are passed through without playback-time normalization.
 //!
 //! The high-level [`transcode_animated_webp`] function composes those stages for

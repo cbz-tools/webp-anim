@@ -2,10 +2,19 @@
 
 All notable changes to `webp-anim` are documented here.
 
-The project is not published to crates.io yet. The first public release will
-be recorded as `0.1.0` when it is published.
-
 ## Unreleased
+
+## 0.1.1 - 2026-08-12
+
+- Added `AnimationDecoder::reset` to reuse a decoder from the start of its
+  stored sequence.
+- Added `AnimationDecoder::frame_durations` to read frame-duration metadata
+  without decoding RGBA pixels.
+- Strengthened Demux metadata validation for frame counts, frame ordering,
+  durations, and configured limits.
+- Improved native decoder cleanup on initialization error paths.
+
+## 0.1.0 - 2026-08-01
 
 - Added the initial sequential animated-WebP inspection, decode, resize, and
   encode API.

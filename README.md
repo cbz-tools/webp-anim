@@ -37,7 +37,8 @@ consuming application
 - `inspect` classifies a complete WebP byte slice as static or animated and
   returns canvas and animation metadata without decoding every frame.
 - `AnimationDecoder` reads one stored animated sequence frame by frame as
-  composited, full-canvas RGBA buffers.
+  composited, full-canvas RGBA buffers, can inspect source durations without
+  pixel decoding, and can reset the sequence without recreating the decoder.
 - `ResizePlan` derives one aspect-ratio-preserving resize operation;
   `ResizeWorkspace` reuses its destination allocation across frames.
 - `AnimationEncoder` accepts full-canvas RGBA frames in presentation order
@@ -52,7 +53,9 @@ types are re-exported at the crate root for the common case.
 ## Features
 
 - Inspect static and animated WebP containers.
+- Inspect stored animation frame durations without decoding RGBA pixels.
 - Decode one stored animation sequence frame by frame.
+- Reset a decoder to the stored sequence start for reuse.
 - Return composited full-canvas RGBA frames.
 - Preserve source frame durations without playback-time normalization.
 - Resize animation frames with a reusable plan and workspace.
@@ -83,6 +86,16 @@ It converts each duration to the cumulative WebP timestamp and flushes the
 last frame duration when `AnimationEncoder::finish` is called. Every frame
 must use the encoder canvas and the exact RGBA buffer length.
 
+`AnimationDecoder::frame_durations` returns one `Duration` per stored frame in
+source order. It reads animation-container metadata only: it does not decode
+RGBA pixels or advance the decoder's sequential frame state. The durations are
+subject to the decoder's configured total-duration limit.
+
+`AnimationDecoder::reset` returns the existing decoder to the first stored
+frame without cloning the input or creating a new native decoder. It is a
+sequence reset, not a random-seek operation; the next `next_frame` call starts
+again at the first frame.
+
 `AnimationInfo::loop_count` and `AnimationInfo::background_color` describe the
 stored WebP animation metadata. `transcode_animated_webp` copies both values
 to the output. `BackgroundColor::raw` is preserved verbatim; this crate does
@@ -94,7 +107,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-webp-anim = "0.1"
+webp-anim = "0.1.1"
 ```
 
 Inspect an input:
@@ -135,6 +148,23 @@ fn process_frames(input: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         let _duration = frame.duration;
     }
 
+    Ok(())
+}
+```
+
+Inspect durations and reuse the same decoder:
+
+```rust
+use webp_anim::{AnimationDecoder, DecodeLimits};
+
+fn inspect_and_reuse(input: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut decoder = AnimationDecoder::new(input, DecodeLimits::default())?;
+    let durations = decoder.frame_durations()?;
+    println!("{} stored frame durations", durations.len());
+
+    let _first = decoder.next_frame()?;
+    decoder.reset();
+    let _first_again = decoder.next_frame()?;
     Ok(())
 }
 ```
@@ -181,6 +211,11 @@ Frames are returned as composited, full-canvas RGBA buffers. Frame durations are
 the source durations and are not adjusted for an application's minimum playback
 delay. The source loop count and ANIM background color are represented as
 explicit values and are retained by the transcode path.
+
+`AnimationDecoder::frame_durations` returns source durations in stored frame
+order without advancing the RGBA decoder or decoding frame pixels.
+`AnimationDecoder::reset` reuses the decoder and restarts sequential decoding
+at the first stored frame; it does not provide random seeking.
 
 The decoder applies configurable resource limits before and during processing.
 Applications should choose limits appropriate for their own input trust model
