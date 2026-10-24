@@ -4,6 +4,12 @@ All notable changes to `webp-anim` are documented here.
 
 ## Unreleased
 
+## [0.1.2] - 2026-10-24
+
+### Improved
+
+- Updated dependencies for improved compatibility and maintenance.
+
 ## 0.1.1 - 2026-08-12
 
 - Added `AnimationDecoder::reset` to reuse a decoder from the start of its

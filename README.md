@@ -107,7 +107,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-webp-anim = "0.1.1"
+webp-anim = "0.1.2"
 ```
 
 Inspect an input:

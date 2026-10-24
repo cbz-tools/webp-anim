@@ -110,9 +110,8 @@ impl AnimationEncoderOptions {
 
 impl Default for AnimationEncoderOptions {
     fn default() -> Self {
-        // libwebp 0.9.6 initializes these mux metadata values to loop_count =
-        // 0 and bgcolor = 0xffffffff. No product compression or key-frame
-        // policy is selected here.
+        // These are the crate's existing default mux metadata values. No
+        // product compression or key-frame policy is selected here.
         Self::new(LoopCount::Infinite, BackgroundColor { raw: 0xffff_ffff })
     }
 }
