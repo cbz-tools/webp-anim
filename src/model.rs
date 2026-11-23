@@ -72,3 +72,17 @@ pub struct AnimationFrame {
     /// Source frame duration, without playback-time normalization.
     pub duration: Duration,
 }
+
+/// A composited, full-canvas BGRA frame and its unmodified source duration.
+///
+/// Pixels are straight-alpha BGRA8 values in tightly packed row-major order.
+/// The channel order is selected directly from libwebp's BGRA decoder output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BgraAnimationFrame {
+    /// Tightly packed BGRA8 pixels in row-major, full-canvas order.
+    pub bgra: Vec<u8>,
+    /// Canvas dimensions of [`Self::bgra`].
+    pub canvas: CanvasSize,
+    /// Source frame duration, without playback-time normalization.
+    pub duration: Duration,
+}

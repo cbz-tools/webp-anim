@@ -2,7 +2,7 @@
 
 ## Development requirements
 
-- Rust 1.85 or newer
+- Rust 1.87 or newer
 - Rust 2024 Edition
 
 The project uses the same checks locally and in CI:

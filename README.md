@@ -11,7 +11,7 @@ transformed, and re-encoded: frame order, source durations, loop count, and ANIM
 background color remain explicit parts of the processing contract.
 
 The input is a complete WebP byte slice; decoded frames are processed one at a
-time instead of being retained as a complete RGBA sequence.
+time instead of being retained as a complete RGBA or BGRA sequence.
 
 Unlike a general-purpose WebP codec wrapper, this crate focuses on the
 animation-aware processing pipeline above the codec layer. It keeps other
@@ -37,14 +37,15 @@ consuming application
 - `inspect` classifies a complete WebP byte slice as static or animated and
   returns canvas and animation metadata without decoding every frame.
 - `AnimationDecoder` reads one stored animated sequence frame by frame as
-  composited, full-canvas RGBA buffers, can inspect source durations without
-  pixel decoding, and can reset the sequence without recreating the decoder.
-- `ResizePlan` derives one aspect-ratio-preserving resize operation;
+  composited, full-canvas RGBA buffers. `BgraAnimationDecoder` provides the
+  same sequence as BGRA buffers directly from libwebp. Both can inspect source
+  durations without pixel decoding and reset without recreating the decoder.
+- `ResizePlan` derives one aspect-ratio-preserving RGBA resize operation;
   `ResizeWorkspace` reuses its destination allocation across frames.
 - `AnimationEncoder` accepts full-canvas RGBA frames in presentation order
   and writes an animated WebP byte vector.
-- `transcode_animated_webp` composes those stages for the common sequential
-  decode-resize-encode path.
+- `transcode_animated_webp` uses the sequential RGBA decode, resize, and
+  encode path.
 
 The modules under `codec`, `inspect`, `model`, `resize`, and `transcode`
 are public for applications that need the lower-level types. The same primary
@@ -53,16 +54,16 @@ types are re-exported at the crate root for the common case.
 ## Features
 
 - Inspect static and animated WebP containers.
-- Inspect stored animation frame durations without decoding RGBA pixels.
+- Inspect stored animation frame durations without decoding pixels.
 - Decode one stored animation sequence frame by frame.
 - Reset a decoder to the stored sequence start for reuse.
-- Return composited full-canvas RGBA frames.
+- Return composited full-canvas RGBA8 or BGRA8 frames.
 - Preserve source frame durations without playback-time normalization.
-- Resize animation frames with a reusable plan and workspace.
-- Encode animated WebP frames in presentation order.
+- Resize RGBA frames with a reusable plan and workspace.
+- Encode RGBA frames as animated WebP in presentation order.
 - Preserve animation loop count and ANIM background color when transcoding.
-- Apply configurable input, canvas, frame-count, and RGBA buffer limits.
-- Avoid retaining the complete decoded RGBA frame sequence in the processing path.
+- Apply configurable input, canvas, frame-count, and decoded frame size limits.
+- Process decoded frames one at a time.
 
 The decoder processes one stored animation sequence and reports its loop count,
 but does not replay frames according to that count. Playback and repetition
@@ -70,31 +71,43 @@ policy belong to the consuming application.
 
 ## Input and output contract
 
-All processing APIs accept a complete WebP byte slice. `inspect` accepts both
-static and animated WebP images. `AnimationDecoder`, `AnimationEncoder`, and
-`transcode_animated_webp` operate on exactly one stored animated sequence;
-they do not implement playback, loop replay, or application-level frame
-queues.
+Inspection, decoding, and transcoding take a complete WebP byte slice.
+`inspect` accepts both static and animated WebP images.
+`AnimationDecoder`, `BgraAnimationDecoder`,
+`AnimationEncoder`, and `transcode_animated_webp` operate on exactly one stored
+animated sequence; they do not implement playback, loop replay, or
+application-level frame queues.
 
-Decoded frames are owned, tightly packed RGBA8 buffers in row-major,
-full-canvas order. A frame for a `width × height` canvas therefore contains
-`width * height * 4` bytes. The decoder returns the source frame duration
-without applying a playback minimum or other normalization.
+`AnimationDecoder` returns pixels in `AnimationFrame::rgba`.
+`BgraAnimationDecoder` gets BGRA8 pixels directly from libwebp and returns them
+in `BgraAnimationFrame::bgra`. Both frame types own a tightly packed,
+row-major buffer of `width * height * 4` bytes with straight alpha and report
+the full canvas dimensions and the unmodified source frame duration.
+
+```rust,no_run
+use webp_anim::{BgraAnimationDecoder, DecodeLimits};
+
+fn process_bgra(input: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut decoder = BgraAnimationDecoder::new(input, DecodeLimits::default())?;
+    while let Some(frame) = decoder.next_frame()? {
+        // Pass tightly packed, straight-alpha BGRA8 to the consumer.
+        let _bgra = frame.bgra;
+    }
+    Ok(())
+}
+```
 
 The encoder requires durations that are an exact whole number of milliseconds.
 It converts each duration to the cumulative WebP timestamp and flushes the
 last frame duration when `AnimationEncoder::finish` is called. Every frame
 must use the encoder canvas and the exact RGBA buffer length.
 
-`AnimationDecoder::frame_durations` returns one `Duration` per stored frame in
-source order. It reads animation-container metadata only: it does not decode
-RGBA pixels or advance the decoder's sequential frame state. The durations are
-subject to the decoder's configured total-duration limit.
+Both decoders expose `frame_durations`, which reads one source `Duration` per
+stored frame in order from the animation metadata. The decoder's frame
+position stays the same, and its configured total-duration limit applies.
 
-`AnimationDecoder::reset` returns the existing decoder to the first stored
-frame without cloning the input or creating a new native decoder. It is a
-sequence reset, not a random-seek operation; the next `next_frame` call starts
-again at the first frame.
+Both decoders expose `reset`, which reuses the input and native decoder.
+The next `next_frame` call starts again at the first stored frame.
 
 `AnimationInfo::loop_count` and `AnimationInfo::background_color` describe the
 stored WebP animation metadata. `transcode_animated_webp` copies both values
@@ -107,7 +120,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-webp-anim = "0.1.2"
+webp-anim = "0.1.3"
 ```
 
 Inspect an input:
@@ -207,15 +220,8 @@ let output = if result.bytes.len() < input.len() {
 
 ## Semantics and limits
 
-Frames are returned as composited, full-canvas RGBA buffers. Frame durations are
-the source durations and are not adjusted for an application's minimum playback
-delay. The source loop count and ANIM background color are represented as
-explicit values and are retained by the transcode path.
-
-`AnimationDecoder::frame_durations` returns source durations in stored frame
-order without advancing the RGBA decoder or decoding frame pixels.
-`AnimationDecoder::reset` reuses the decoder and restarts sequential decoding
-at the first stored frame; it does not provide random seeking.
+Frame durations retain the source timing. The transcode path also retains the
+source loop count and ANIM background color.
 
 The decoder applies configurable resource limits before and during processing.
 Applications should choose limits appropriate for their own input trust model
@@ -230,7 +236,7 @@ The default decoder and inspection limits are:
 | Canvas pixels | 100,000,000 |
 | Stored frame count | 10,000 |
 | Total source duration | 1 hour (decoder only) |
-| RGBA bytes per frame | 400 MiB |
+| Decoded RGBA8 or BGRA8 bytes per frame (`DecodeLimits::max_frame_rgba_bytes`) | 400 MiB |
 
 `ResizeOptions::max_output_rgba_bytes` adds a destination-buffer limit for a
 resize plan. `DecodeLimits::for_trusted_input` and
@@ -309,7 +315,7 @@ code.
 
 ## Requirements
 
-- Rust 1.85 or newer
+- Rust 1.87 or newer
 - Rust 2024 Edition
 
 The crate uses `libwebp-sys` for WebP decoding and encoding.

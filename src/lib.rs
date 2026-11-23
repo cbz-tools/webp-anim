@@ -3,8 +3,9 @@
 //! Inspect, decode, resize, and encode animated WebP images.
 //!
 //! The crate exposes lightweight frame-duration metadata inspection, sequential
-//! full-canvas RGBA decoding, reusable animation-frame resizing, and sequential
-//! animated-WebP encoding. [`AnimationDecoder::frame_durations`] reads stored
+//! full-canvas RGBA decoding, direct full-canvas BGRA decoding, reusable
+//! animation-frame resizing, and sequential animated-WebP encoding.
+//! [`AnimationDecoder::frame_durations`] reads stored
 //! durations without decoding pixels or advancing the decoder, while
 //! [`AnimationDecoder::reset`] reuses a decoder from the start of its sequence.
 //! Frame durations are passed through without playback-time normalization.
@@ -25,14 +26,15 @@ pub mod resize;
 /// The sequential decode-resize-encode convenience pipeline.
 pub mod transcode;
 
-pub use codec::decode::{AnimationDecoder, DecodeError, DecodeLimits};
+pub use codec::decode::{AnimationDecoder, BgraAnimationDecoder, DecodeError, DecodeLimits};
 pub use codec::encode::{
     AnimationEncoder, AnimationEncoderOptions, AnimationMuxOverrides, EncodeError,
     EncoderConfigOverrides,
 };
 pub use inspect::{InspectError, InspectLimits, WebpKind, inspect, is_animated_webp_fast};
 pub use model::{
-    AnimationFrame, AnimationInfo, BackgroundColor, CanvasSize, LoopCount, StaticWebpInfo,
+    AnimationFrame, AnimationInfo, BackgroundColor, BgraAnimationFrame, CanvasSize, LoopCount,
+    StaticWebpInfo,
 };
 pub use resize::{ResizeError, ResizeFilter, ResizeOptions, ResizePlan, ResizeWorkspace};
 pub use transcode::{

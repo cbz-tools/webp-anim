@@ -10,7 +10,9 @@ use libwebp_sys::{
 
 use crate::{
     inspect::is_animated_webp_fast,
-    model::{AnimationFrame, AnimationInfo, BackgroundColor, CanvasSize, LoopCount},
+    model::{
+        AnimationFrame, AnimationInfo, BackgroundColor, BgraAnimationFrame, CanvasSize, LoopCount,
+    },
 };
 
 /// Per-animation limits applied before and while decoding.
@@ -20,7 +22,7 @@ use crate::{
 /// appropriate process-wide memory and workload policy.
 #[derive(Clone, Debug)]
 pub struct DecodeLimits {
-    /// Maximum number of input bytes accepted by [`AnimationDecoder::new`].
+    /// Maximum number of input bytes accepted by either decoder constructor.
     pub max_input_bytes: usize,
     /// Maximum number of pixels in the decoded animation canvas.
     pub max_canvas_pixels: u64,
@@ -28,7 +30,7 @@ pub struct DecodeLimits {
     pub max_frame_count: u32,
     /// Maximum sum of source frame durations observed while decoding.
     pub max_total_duration: Duration,
-    /// Maximum number of bytes in one full-canvas RGBA frame.
+    /// Maximum number of bytes in one full-canvas decoded RGBA8 or BGRA8 frame.
     pub max_frame_rgba_bytes: usize,
 }
 
@@ -130,19 +132,30 @@ impl fmt::Display for DecodeError {
 
 impl Error for DecodeError {}
 
-/// Stateful decoder for exactly one stored animation sequence.
+/// Stateful decoder for exactly one stored animation sequence with RGBA8 output.
 pub struct AnimationDecoder {
+    inner: AnimationDecoderInner,
+}
+
+/// Stateful decoder that returns composited BGRA8 frames.
+///
+/// Use [`AnimationDecoder`] to retain the existing RGBA8 output contract.
+pub struct BgraAnimationDecoder {
+    inner: AnimationDecoderInner,
+}
+
+struct AnimationDecoderInner {
     // The C decoder borrows this allocation for its complete lifetime.
     _input: Vec<u8>,
     decoder: *mut WebPAnimDecoder,
     info: AnimationInfo,
-    frame_rgba_bytes: usize,
+    frame_bytes: usize,
     previous_timestamp_ms: i32,
     total_duration: Duration,
     max_total_duration: Duration,
 }
 
-impl Drop for AnimationDecoder {
+impl Drop for AnimationDecoderInner {
     fn drop(&mut self) {
         // SAFETY: `decoder` is created only by libwebp and released exactly once here.
         unsafe {
@@ -207,13 +220,17 @@ impl Drop for DemuxIteratorGuard {
     }
 }
 
-impl AnimationDecoder {
+impl AnimationDecoderInner {
     /// Creates a decoder for one stored animated WebP sequence.
     ///
     /// The input bytes are copied so the returned decoder owns the data needed
-    /// by libwebp. Frames are returned as composited, full-canvas RGBA buffers.
+    /// by libwebp. Frames are returned in the selected 4-byte-per-pixel mode.
     /// The decoder does not replay the sequence according to its loop count.
-    pub fn new(input: &[u8], limits: DecodeLimits) -> Result<Self, DecodeError> {
+    fn new(
+        input: &[u8],
+        limits: DecodeLimits,
+        color_mode: WEBP_CSP_MODE,
+    ) -> Result<Self, DecodeError> {
         if input.len() > limits.max_input_bytes {
             return Err(DecodeError::InputTooLarge {
                 actual: input.len(),
@@ -232,7 +249,7 @@ impl AnimationDecoder {
         if unsafe { WebPAnimDecoderOptionsInitInternal(&mut options, demux_abi) } == 0 {
             return Err(DecodeError::DecoderOptionsInitialization);
         }
-        options.color_mode = WEBP_CSP_MODE::MODE_RGBA;
+        options.color_mode = color_mode;
         options.use_threads = 1;
 
         let data = WebPData {
@@ -264,10 +281,14 @@ impl AnimationDecoder {
             u64::from(raw_info.frame_count),
             u64::from(limits.max_frame_count),
         )?;
-        let frame_rgba_bytes = canvas.rgba_bytes().ok_or(DecodeError::FrameSizeOverflow)?;
+        let frame_bytes = canvas.rgba_bytes().ok_or(DecodeError::FrameSizeOverflow)?;
         enforce_limit(
-            "RGBA bytes per frame",
-            u64::try_from(frame_rgba_bytes).unwrap_or(u64::MAX),
+            if matches!(color_mode, WEBP_CSP_MODE::MODE_BGRA) {
+                "BGRA bytes per frame"
+            } else {
+                "RGBA bytes per frame"
+            },
+            u64::try_from(frame_bytes).unwrap_or(u64::MAX),
             u64::try_from(limits.max_frame_rgba_bytes).unwrap_or(u64::MAX),
         )?;
 
@@ -291,7 +312,7 @@ impl AnimationDecoder {
                     raw: raw_info.bgcolor,
                 },
             },
-            frame_rgba_bytes,
+            frame_bytes,
             previous_timestamp_ms: 0,
             total_duration: Duration::ZERO,
             max_total_duration: limits.max_total_duration,
@@ -299,16 +320,16 @@ impl AnimationDecoder {
     }
 
     /// Returns metadata for the stored animation sequence.
-    pub fn info(&self) -> &AnimationInfo {
+    fn info(&self) -> &AnimationInfo {
         &self.info
     }
 
     /// Returns one source display duration per stored frame, in frame order.
     ///
-    /// This reads animation-container metadata only: it does not decode RGBA
-    /// pixels or advance the sequential decoder. The configured total-duration
+    /// This reads animation-container metadata only: it does not decode pixel
+    /// data or advance the sequential decoder. The configured total-duration
     /// limit is applied and may cause this method to return an error.
-    pub fn frame_durations(&self) -> Result<Vec<Duration>, DecodeError> {
+    fn frame_durations(&self) -> Result<Vec<Duration>, DecodeError> {
         // SAFETY: `decoder` is non-null and remains valid for this value's lifetime;
         // libwebp returns a borrowed demuxer owned by that decoder.
         let demuxer = unsafe { WebPAnimDecoderGetDemuxer(self.decoder) };
@@ -383,10 +404,9 @@ impl AnimationDecoder {
     ///
     /// The decoder, input allocation, immutable metadata, and configured limits
     /// are preserved; only libwebp's sequence state and this wrapper's timing
-    /// accumulator are reset.
-    /// This is a sequence reset, not a random-seek operation; the next
-    /// [`Self::next_frame`] call starts at the first stored frame.
-    pub fn reset(&mut self) {
+    /// accumulator are reset. The next `next_pixels` call starts at the first
+    /// stored frame.
+    fn reset(&mut self) {
         // SAFETY: `decoder` is non-null and remains valid for this value's lifetime;
         // libwebp resets only the native decoder sequence state.
         unsafe { WebPAnimDecoderReset(self.decoder) };
@@ -395,22 +415,22 @@ impl AnimationDecoder {
     }
 
     /// Returns whether unread frames remain in the stored sequence.
-    pub fn has_more_frames(&self) -> bool {
+    fn has_more_frames(&self) -> bool {
         // SAFETY: the decoder is valid until `Drop`; this query does not advance it.
         unsafe { WebPAnimDecoderHasMoreFrames(self.decoder) != 0 }
     }
 
     /// Returns `None` only after every frame in the stored sequence was read.
-    pub fn next_frame(&mut self) -> Result<Option<AnimationFrame>, DecodeError> {
+    fn next_pixels(&mut self) -> Result<Option<(Vec<u8>, Duration)>, DecodeError> {
         if !self.has_more_frames() {
             return Ok(None);
         }
 
-        let mut rgba = std::ptr::null_mut();
+        let mut pixels = std::ptr::null_mut();
         let mut timestamp_ms = 0_i32;
         // SAFETY: libwebp writes both output pointers for a valid decoder state.
-        let ok = unsafe { WebPAnimDecoderGetNext(self.decoder, &mut rgba, &mut timestamp_ms) };
-        if ok == 0 || rgba.is_null() {
+        let ok = unsafe { WebPAnimDecoderGetNext(self.decoder, &mut pixels, &mut timestamp_ms) };
+        if ok == 0 || pixels.is_null() {
             return Err(DecodeError::FrameDecode);
         }
         let duration_ms = timestamp_ms
@@ -432,16 +452,119 @@ impl AnimationDecoder {
                 .unwrap_or(u64::MAX),
         )?;
 
-        // SAFETY: libwebp returns a full-canvas RGBA buffer with the checked size above.
-        let rgba = unsafe { std::slice::from_raw_parts(rgba, self.frame_rgba_bytes) }.to_vec();
+        // SAFETY: libwebp returns a full-canvas 4-byte-per-pixel buffer in the
+        // color mode selected at construction, with the checked size above.
+        // This copy gives the caller owned frame data; no channel swizzle occurs.
+        let pixels = unsafe { std::slice::from_raw_parts(pixels, self.frame_bytes) }.to_vec();
         self.previous_timestamp_ms = timestamp_ms;
         self.total_duration = total_duration;
 
-        Ok(Some(AnimationFrame {
-            rgba,
-            canvas: self.info.canvas,
-            duration,
-        }))
+        Ok(Some((pixels, duration)))
+    }
+}
+
+impl AnimationDecoder {
+    /// Creates a decoder for one stored animated WebP sequence.
+    ///
+    /// Frames are returned as composited, full-canvas straight-alpha RGBA8
+    /// buffers. This constructor preserves the original RGBA output behavior.
+    /// The decoder does not replay the sequence according to its loop count.
+    pub fn new(input: &[u8], limits: DecodeLimits) -> Result<Self, DecodeError> {
+        Ok(Self {
+            inner: AnimationDecoderInner::new(input, limits, WEBP_CSP_MODE::MODE_RGBA)?,
+        })
+    }
+
+    /// Returns metadata for the stored animation sequence.
+    pub fn info(&self) -> &AnimationInfo {
+        self.inner.info()
+    }
+
+    /// Returns one source display duration per stored frame, in frame order.
+    ///
+    /// This reads animation-container metadata only: it does not decode pixels
+    /// or advance the sequential decoder. The configured total-duration limit
+    /// is applied and may cause this method to return an error.
+    pub fn frame_durations(&self) -> Result<Vec<Duration>, DecodeError> {
+        self.inner.frame_durations()
+    }
+
+    /// Resets this decoder to the first frame of its stored animation sequence.
+    ///
+    /// The decoder, input allocation, immutable metadata, and configured limits
+    /// are preserved; only libwebp's sequence state and timing accumulator are
+    /// reset. The next [`Self::next_frame`] call starts at the first frame.
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    /// Returns whether unread frames remain in the stored sequence.
+    pub fn has_more_frames(&self) -> bool {
+        self.inner.has_more_frames()
+    }
+
+    /// Returns `None` only after every frame in the stored sequence was read.
+    pub fn next_frame(&mut self) -> Result<Option<AnimationFrame>, DecodeError> {
+        self.inner.next_pixels().map(|frame| {
+            frame.map(|(rgba, duration)| AnimationFrame {
+                rgba,
+                canvas: self.inner.info.canvas,
+                duration,
+            })
+        })
+    }
+}
+
+impl BgraAnimationDecoder {
+    /// Creates a decoder that returns composited, full-canvas BGRA8 frames.
+    ///
+    /// libwebp decodes directly into straight-alpha BGRA8 pixels. The returned
+    /// [`BgraAnimationFrame::bgra`] field owns that output; this crate does not
+    /// convert RGBA bytes to BGRA bytes in Rust. The decoder processes one
+    /// stored sequence and does not replay it according to its loop count.
+    pub fn new(input: &[u8], limits: DecodeLimits) -> Result<Self, DecodeError> {
+        Ok(Self {
+            inner: AnimationDecoderInner::new(input, limits, WEBP_CSP_MODE::MODE_BGRA)?,
+        })
+    }
+
+    /// Returns metadata for the stored animation sequence.
+    pub fn info(&self) -> &AnimationInfo {
+        self.inner.info()
+    }
+
+    /// Returns one source display duration per stored frame, in frame order.
+    ///
+    /// This reads animation-container metadata only: it does not decode pixels
+    /// or advance the sequential decoder. The configured total-duration limit
+    /// is applied and may cause this method to return an error.
+    pub fn frame_durations(&self) -> Result<Vec<Duration>, DecodeError> {
+        self.inner.frame_durations()
+    }
+
+    /// Resets this decoder to the first frame of its stored animation sequence.
+    ///
+    /// The decoder, input allocation, immutable metadata, and configured limits
+    /// are preserved; only libwebp's sequence state and timing accumulator are
+    /// reset. The next [`Self::next_frame`] call starts at the first frame.
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    /// Returns whether unread frames remain in the stored sequence.
+    pub fn has_more_frames(&self) -> bool {
+        self.inner.has_more_frames()
+    }
+
+    /// Returns `None` only after every frame in the stored sequence was read.
+    pub fn next_frame(&mut self) -> Result<Option<BgraAnimationFrame>, DecodeError> {
+        self.inner.next_pixels().map(|frame| {
+            frame.map(|(bgra, duration)| BgraAnimationFrame {
+                bgra,
+                canvas: self.inner.info.canvas,
+                duration,
+            })
+        })
     }
 }
 
